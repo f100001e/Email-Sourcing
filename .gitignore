@@ -1,0 +1,16 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Environment files (ignore real ones, keep .env.example)
+.env
+.env.local
+
+# Docs
+*.json
+*.csv
