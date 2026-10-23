@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
-"""Export unique email addresses in Gmail messages, not just Google Contacts.
+"""Export unique email addresses from Gmail message headers to SQLite and CSV.
+
+Spam and Trash are excluded. The SQLite database resumes interrupted exports.
+Only headers are requested; message bodies are never read.
 
 Setup:
-  pip install --upgrade google-api-python-client google-auth-httplib2 google-auth-oauthlib
-  Save OAuth Desktop credentials as credentials.json beside this script.
+  pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
+  Save OAuth Desktop client credentials as credentials.json beside this script.
 
 Examples:
-  python gmail_correspondents.py
-  python gmail_correspondents.py --start 2020-01-01 --end 2026-10-23
-  python gmail_correspondents.py --include-spam-trash --my-address alias@example.com
+  python email_sourcing.py
+  python email_sourcing.py --start 2020-01-01 --end 2026-10-23
+  python email_sourcing.py --my-address alias@example.com
 
-The optional start/end dates use UTC calendar days and are inclusive.
-Only message headers are read, never message bodies.
+Date filters are inclusive UTC calendar dates. Changing account, search, or
+excluded addresses requires a separate database (rename emails.db while the
+script is stopped). Do not run two copies against the same database at once.
 """
 
 import argparse
 import csv
-from datetime import date, datetime, time, timedelta, timezone
+import json
+import sqlite3
+import time
+from datetime import date, datetime, time as clock_time, timedelta, timezone
 from email.utils import getaddresses
 from pathlib import Path
 
@@ -28,6 +35,27 @@ from googleapiclient.errors import HttpError
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 HEADERS = ["From", "To", "Cc", "Bcc"]
+
+
+def execute_retry(request, attempts=6):
+    """Retry temporary API failures, including Gmail per-minute 403 limits."""
+    for attempt in range(attempts):
+        try:
+            return request.execute(num_retries=0)
+        except HttpError as error:
+            status = getattr(error.resp, "status", None)
+            detail = str(error).lower()
+            retryable = status in (429, 500, 502, 503, 504) or (
+                status == 403 and any(term in detail for term in (
+                    "ratelimitexceeded", "userratelimitexceeded", "quota exceeded"
+                ))
+            )
+            if not retryable or attempt == attempts - 1:
+                raise
+            delay = min(60, 5 * (2 ** attempt))
+            print(f"Temporary Gmail API error ({status}); retrying in {delay}s")
+            time.sleep(delay)
+
 
 def authorize(script_dir):
     token_file = script_dir / "token.json"
@@ -41,8 +69,8 @@ def authorize(script_dir):
         else:
             if not credentials_file.exists():
                 raise FileNotFoundError(
-                    f"Missing {credentials_file}. Download OAuth Desktop client credentials "
-                    "from Google Cloud and save them as credentials.json."
+                    f"Missing {credentials_file}. Download OAuth Desktop client "
+                    "credentials and save them as credentials.json."
                 )
             flow = InstalledAppFlow.from_client_secrets_file(
                 str(credentials_file), SCOPES
@@ -52,131 +80,211 @@ def authorize(script_dir):
     return build("gmail", "v1", credentials=creds)
 
 
+def init_db():
+    db_path = Path(__file__).resolve().parent / "emails.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS contacts (
+            email TEXT PRIMARY KEY COLLATE NOCASE,
+            name TEXT NOT NULL DEFAULT '',
+            first_seen_utc TEXT NOT NULL,
+            last_seen_utc TEXT NOT NULL,
+            sent_messages INTEGER NOT NULL DEFAULT 0,
+            received_messages INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS processed_messages (
+            message_id TEXT PRIMARY KEY,
+            processed_at_utc TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS export_settings (
+            setting TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+    """)
+    conn.commit()
+    return conn
+
+
 def build_search(start, end):
+    if start and end and date.fromisoformat(start) > date.fromisoformat(end):
+        raise ValueError("--start must be on or before --end")
     terms = []
     if start:
-        start_date = date.fromisoformat(start)
-        instant = datetime.combine(start_date, time.min, tzinfo=timezone.utc)
+        instant = datetime.combine(date.fromisoformat(start), clock_time.min, tzinfo=timezone.utc)
         terms.append(f"after:{int(instant.timestamp())}")
     if end:
         end_date = date.fromisoformat(end) + timedelta(days=1)
-        instant = datetime.combine(end_date, time.min, tzinfo=timezone.utc)
+        instant = datetime.combine(end_date, clock_time.min, tzinfo=timezone.utc)
         terms.append(f"before:{int(instant.timestamp())}")
-    if start and end and date.fromisoformat(start) > date.fromisoformat(end):
-        raise ValueError("--start must be on or before --end")
     return " ".join(terms)
 
 
 def safe_for_csv(value):
-    # Prevent spreadsheet apps from treating a sender's display name as a formula.
+    value = str(value)
     return "'" + value if value.lstrip().startswith(("=", "+", "-", "@")) else value
 
 
-def export(service, search, include_spam_trash, my_addresses, output):
+def export(service, search, my_addresses, output, conn):
     my_addresses = {address.strip().lower() for address in my_addresses}
-    profile = service.users().getProfile(userId="me").execute(num_retries=5)
+    profile = execute_retry(service.users().getProfile(userId="me"))
     my_addresses.add(profile["emailAddress"].lower())
-    contacts = {}
-    page_token = None
-    processed = 0
 
-    while True:
-        params = {
-            "userId": "me",
-            "maxResults": 500,
-            "includeSpamTrash": include_spam_trash,
-        }
-        if search:
-            params["q"] = search
-        if page_token:
-            params["pageToken"] = page_token
-
-        page = service.users().messages().list(**params).execute(num_retries=5)
-        for item in page.get("messages", []):
-            try:
-                msg = service.users().messages().get(
-                    userId="me",
-                    id=item["id"],
-                    format="metadata",
-                    metadataHeaders=HEADERS,
-                ).execute(num_retries=5)
-            except HttpError as exc:
-                if exc.resp.status == 404:  # Message deleted during export
-                    continue
-                raise
-
-            headers = {name.lower(): [] for name in HEADERS}
-            for entry in msg.get("payload", {}).get("headers", []):
-                key = entry["name"].lower()
-                if key in headers:
-                    headers[key].append(entry["value"])
-
-            participants = {}
-            for header_values in headers.values():
-                for name, address in getaddresses(header_values):
-                    address = address.strip().lower()
-                    if not address or "@" not in address or address in my_addresses:
-                        continue
-                    participants[address] = name.strip() or participants.get(address, "")
-
-            when = datetime.fromtimestamp(
-                int(msg["internalDate"]) / 1000, tz=timezone.utc
+    # A checkpoint database must not be reused with a different account or filter.
+    settings = json.dumps({
+        "account": profile["emailAddress"].lower(),
+        "search": search,
+        "my_addresses": sorted(my_addresses),
+        "spam_trash": False,
+    }, sort_keys=True)
+    previous = conn.execute(
+        "SELECT value FROM export_settings WHERE setting = 'run_config'"
+    ).fetchone()
+    if previous is not None and previous[0] != settings:
+        raise ValueError(
+            "This emails.db uses a different Gmail account/date range/alias list. "
+            "Rename emails.db while the script is stopped and rerun to start fresh."
+        )
+    if previous is None:
+        message_count = conn.execute("SELECT COUNT(*) FROM processed_messages").fetchone()[0]
+        contact_count = conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
+        if message_count or contact_count:
+            raise ValueError(
+                "Existing database data has no saved account settings. "
+                "Rename emails.db and start a fresh export."
             )
-            is_sent = "SENT" in msg.get("labelIds", [])
-            for address, name in participants.items():
-                record = contacts.setdefault(address, {
-                    "name": "",
-                    "first": when,
-                    "last": when,
-                    "sent": 0,
-                    "received": 0,
-                })
-                if name and not record["name"]:
-                    record["name"] = name
-                record["first"] = min(record["first"], when)
-                record["last"] = max(record["last"], when)
-                record["sent" if is_sent else "received"] += 1
+        conn.execute(
+            "INSERT INTO export_settings(setting, value) VALUES ('run_config', ?)",
+            (settings,)
+        )
+        conn.commit()
 
-            processed += 1
-            if processed % 500 == 0:
-                print(f"Processed {processed:,} messages; found {len(contacts):,} addresses")
+    processed = 0
+    skipped = 0
+    page_token = None
 
-        page_token = page.get("nextPageToken")
-        if not page_token:
-            break
+    try:
+        while True:
+            params = {"userId": "me", "maxResults": 500, "includeSpamTrash": False}
+            if search:
+                params["q"] = search
+            if page_token:
+                params["pageToken"] = page_token
 
+            page = execute_retry(service.users().messages().list(**params))
+            for item in page.get("messages", []):
+                message_id = item["id"]
+                exists = conn.execute(
+                    "SELECT 1 FROM processed_messages WHERE message_id = ?",
+                    (message_id,)
+                ).fetchone()
+                if exists:
+                    skipped += 1
+                    continue
+
+                # # Time constraint api max is 6,000 API units 
+                # (300 messages * (20 per message) per minute) time delay of .24 seconds is 60/.24 = 250 messages per minute, 
+                # which is under the limit of 300 messages per minute. This is to avoid hitting the API rate limit.
+                time.sleep(0.24)
+                try:
+                    msg = execute_retry(service.users().messages().get(
+                        userId="me", id=message_id, format="metadata",
+                        metadataHeaders=HEADERS
+                    ))
+                except HttpError as error:
+                    if getattr(error.resp, "status", None) == 404:
+                        continue  # Message deleted during extraction.
+                    raise
+
+                headers = {name.lower(): [] for name in HEADERS}
+                for entry in msg.get("payload", {}).get("headers", []):
+                    key = entry["name"].lower()
+                    if key in headers:
+                        headers[key].append(entry["value"])
+
+                participants = {}
+                for values in headers.values():
+                    for name, address in getaddresses(values):
+                        address = address.strip().lower()
+                        if not address or "@" not in address or address in my_addresses:
+                            continue
+                        participants[address] = name.strip() or participants.get(address, "")
+
+                when = datetime.fromtimestamp(
+                    int(msg["internalDate"]) / 1000, tz=timezone.utc
+                ).isoformat(timespec="seconds")
+                is_sent = "SENT" in msg.get("labelIds", [])
+
+                # Contact counts and processed ID live in the same transaction.
+                for address, name in participants.items():
+                    conn.execute("""
+                        INSERT INTO contacts (
+                            email, name, first_seen_utc, last_seen_utc,
+                            sent_messages, received_messages
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(email) DO UPDATE SET
+                            name = CASE WHEN contacts.name = ''
+                                        THEN excluded.name ELSE contacts.name END,
+                            first_seen_utc = MIN(contacts.first_seen_utc, excluded.first_seen_utc),
+                            last_seen_utc = MAX(contacts.last_seen_utc, excluded.last_seen_utc),
+                            sent_messages = contacts.sent_messages + excluded.sent_messages,
+                            received_messages = contacts.received_messages + excluded.received_messages
+                    """, (address, name, when, when, int(is_sent), int(not is_sent)))
+
+                conn.execute(
+                    "INSERT INTO processed_messages(message_id) VALUES (?)",
+                    (message_id,)
+                )
+                processed += 1
+                if processed % 500 == 0:
+                    conn.commit()
+                    count = conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
+                    print(f"Processed {processed:,} new messages; {count:,} addresses; {skipped:,} skipped")
+
+            page_token = page.get("nextPageToken")
+            if not page_token:
+                break
+        conn.commit()
+    except BaseException:
+        conn.rollback()  # Keep previous committed batches, discard partial batch.
+        raise
+
+    # Write CSV from persisted records, including records from previous runs.
     with output.open("w", newline="", encoding="utf-8-sig") as fp:
         writer = csv.writer(fp)
         writer.writerow([
             "email", "name", "first_seen_utc", "last_seen_utc",
-            "sent_messages", "received_messages", "total_messages",
+            "sent_messages", "received_messages", "total_messages"
         ])
-        for address, record in sorted(contacts.items()):
-            writer.writerow([
-                safe_for_csv(address),
-                safe_for_csv(record["name"]),
-                record["first"].isoformat(timespec="seconds"),
-                record["last"].isoformat(timespec="seconds"),
-                record["sent"],
-                record["received"],
-                record["sent"] + record["received"],
-            ])
-    print(f"Exported {len(contacts):,} unique addresses from {processed:,} messages to {output}")
+        for row in conn.execute("""
+            SELECT email, name, first_seen_utc, last_seen_utc,
+                   sent_messages, received_messages,
+                   sent_messages + received_messages
+            FROM contacts ORDER BY email COLLATE NOCASE
+        """):
+            writer.writerow([safe_for_csv(row[0]), safe_for_csv(row[1]), *row[2:]])
+
+    count = conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
+    print(f"Exported {count:,} unique addresses to {output}; {processed:,} new messages, {skipped:,} skipped")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--start", metavar="YYYY-MM-DD", help="First UTC date (inclusive)")
-    parser.add_argument("--end", metavar="YYYY-MM-DD", help="Last UTC date (inclusive)")
+    parser.add_argument("--start", metavar="YYYY-MM-DD")
+    parser.add_argument("--end", metavar="YYYY-MM-DD")
     parser.add_argument("--output", default="gmail_correspondents.csv")
-    parser.add_argument("--include-spam-trash", action="store_true")
-    parser.add_argument("--my-address", action="append", default=[],
-                        help="Other email address you own; repeat for aliases")
+    parser.add_argument("--my-address", action="append", default=[])
     args = parser.parse_args()
     search = build_search(args.start, args.end)
-    service = authorize(Path(__file__).resolve().parent)
-    export(service, search, args.include_spam_trash,
-           args.my_address, Path(args.output))
+
+    conn = init_db()
+    try:
+        service = authorize(Path(__file__).resolve().parent)
+        export(service, search, args.my_address, Path(args.output), conn)
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
