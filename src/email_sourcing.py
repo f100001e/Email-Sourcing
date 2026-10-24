@@ -194,8 +194,17 @@ def export(service, search, my_addresses, output, conn):
                         metadataHeaders=HEADERS
                     ))
                 except HttpError as error:
-                    if getattr(error.resp, "status", None) == 404:
-                        continue  # Message deleted during extraction.
+                    status = getattr(error.resp, "status", None)
+                    detail = str(error).lower()
+
+                    if status == 404:
+                        print(f"Message {message_id} not found. Skipping.")
+                        continue
+
+                    if status == 400 and "failedprecondition" in detail:
+                        print(f"Message {message_id}: precondition failed. Skipping.")
+                        continue
+
                     raise
 
                 headers = {name.lower(): [] for name in HEADERS}
