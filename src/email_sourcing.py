@@ -273,7 +273,10 @@ def export(service, search, my_addresses, output, conn):
                    sent_messages + received_messages
             FROM contacts ORDER BY email COLLATE NOCASE
         """):
-            writer.writerow([safe_for_csv(row[0]), safe_for_csv(row[1]), *row[2:]])
+            writer.writerow([
+                safe_for_csv(str(value)) if value is not None else ""
+                for value in row
+            ])
 
     count = conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
     print(f"Exported {count:,} unique addresses to {output}; {processed:,} new messages, {skipped:,} skipped")
